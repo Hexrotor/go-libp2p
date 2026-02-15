@@ -2,6 +2,7 @@ package network
 
 import (
 	"context"
+	"net"
 	"time"
 )
 
@@ -127,4 +128,27 @@ func GetUseTransient(ctx context.Context) (usetransient bool, reason string) {
 		return true, v.(string)
 	}
 	return false, ""
+}
+
+// PunchedSocketInfo carries a pre-punched UDP socket through context
+// so the QUIC transport can use it instead of allocating a new socket.
+// EXPERIMENTAL: Used by DCUtR v2 for Symmetric NAT hole punching.
+type PunchedSocketInfo struct {
+	Conn       *net.UDPConn
+	RemoteAddr *net.UDPAddr
+}
+
+type punchedSocketCtxKey struct{}
+
+// WithPunchedSocket constructs a new context carrying a punched socket.
+// EXPERIMENTAL
+func WithPunchedSocket(ctx context.Context, info *PunchedSocketInfo) context.Context {
+	return context.WithValue(ctx, punchedSocketCtxKey{}, info)
+}
+
+// GetPunchedSocket returns the punched socket info if set in the context.
+// EXPERIMENTAL
+func GetPunchedSocket(ctx context.Context) *PunchedSocketInfo {
+	v, _ := ctx.Value(punchedSocketCtxKey{}).(*PunchedSocketInfo)
+	return v
 }

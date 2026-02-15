@@ -48,6 +48,9 @@ type holePuncher struct {
 
 	tracer *tracer
 	filter AddrFilter
+
+	// V2: NAT detector for symmetric NAT hole punching (nil disables v2)
+	natDetector *NATDetector
 }
 
 func newHolePuncher(h host.Host, ids identify.IDService, listenAddrs func() []ma.Multiaddr, tracer *tracer, filter AddrFilter) *holePuncher {
@@ -132,7 +135,17 @@ func (hp *holePuncher) directConnect(rp peer.ID) error {
 
 	log.Debug("got inbound proxy conn", "destination_peer", rp)
 
-	// hole punch
+	// Try v2 hole punch if NAT detector is available
+	if hp.natDetector != nil {
+		err := hp.directConnectV2(rp)
+		if err == nil {
+			hp.tracer.HolePunchFinished("initiator-v2", 1, nil, nil, getDirectConnection(hp.host, rp))
+			return nil
+		}
+		log.Debug("v2 hole punch failed, falling back to v1", "peer", rp, "err", err)
+	}
+
+	// v1 hole punch
 	for i := 1; i <= maxRetries; i++ {
 		isClient := false
 		// On the last attempt we switch roles in case the connection is

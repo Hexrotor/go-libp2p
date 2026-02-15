@@ -7,11 +7,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	logging "github.com/libp2p/go-libp2p/gologshim"
+	"github.com/libp2p/go-libp2p/p2p/host/eventbus"
 	"github.com/libp2p/go-libp2p/p2p/protocol/holepunch/pb"
 	"github.com/libp2p/go-libp2p/p2p/protocol/identify"
 	"github.com/libp2p/go-msgio/pbio"
@@ -23,6 +25,9 @@ const defaultDirectDialTimeout = 10 * time.Second
 
 // Protocol is the libp2p protocol for Hole Punching.
 const Protocol protocol.ID = "/libp2p/dcutr"
+
+// ProtocolV2 is the libp2p protocol for DCUtR v2 with symmetric NAT support.
+const ProtocolV2 protocol.ID = "/libp2p/dcutr/v2"
 
 var log = logging.Logger("p2p-holepunch")
 
@@ -43,6 +48,27 @@ type Option func(*Service) error
 func DirectDialTimeout(timeout time.Duration) Option {
 	return func(s *Service) error {
 		s.directDialTimeout = timeout
+		return nil
+	}
+}
+
+// WithSTUNServers enables DCUtR v2 with STUN servers as fallback for NAT
+// type detection. ObservedAddr-based detection is used as primary method;
+// STUN is only queried when observations are insufficient.
+// At least 2 servers are needed for reliable STUN detection.
+func WithSTUNServers(servers []string) Option {
+	return func(s *Service) error {
+		s.natDetector = NewNATDetector(s.host, servers, 0)
+		return nil
+	}
+}
+
+// EnableV2 enables DCUtR v2 hole punching using ObservedAddr-based NAT
+// detection from existing connections. No external STUN servers are required.
+// For more precise NAT sub-type classification, use WithSTUNServers instead.
+func EnableV2() Option {
+	return func(s *Service) error {
+		s.natDetector = NewNATDetector(s.host, nil, 0)
 		return nil
 	}
 }
@@ -71,6 +97,11 @@ type Service struct {
 	filter AddrFilter
 
 	refCount sync.WaitGroup
+
+	// V2: NAT detector for symmetric NAT hole punching
+	natDetector *NATDetector
+	// addrSub watches for address changes to invalidate NAT cache
+	addrSub event.Subscription
 }
 
 // NewService creates a new service that can be used for hole punching
@@ -104,6 +135,21 @@ func NewService(h host.Host, ids identify.IDService, listenAddrs func() []ma.Mul
 	}
 	s.tracer.Start()
 
+	// Subscribe to address changes so we can invalidate NAT cache on network changes
+	if s.natDetector != nil {
+		sub, err := s.host.EventBus().Subscribe(
+			new(event.EvtLocalAddressesUpdated),
+			eventbus.Name("holepunch-v2"),
+		)
+		if err != nil {
+			log.Debug("failed to subscribe to address events", "err", err)
+		} else {
+			s.addrSub = sub
+			s.refCount.Add(1)
+			go s.watchAddressChanges()
+		}
+	}
+
 	s.refCount.Add(1)
 	go s.waitForPublicAddr()
 
@@ -127,6 +173,9 @@ func (s *Service) waitForPublicAddr() {
 		if len(s.listenAddrs()) > 0 {
 			log.Debug("Host now has a public address", "hostID", s.host.ID(), "addresses", s.host.Addrs())
 			s.host.SetStreamHandler(Protocol, s.handleNewStream)
+			if s.natDetector != nil {
+				s.host.SetStreamHandler(ProtocolV2, s.handleNewStreamV2)
+			}
 			break
 		}
 
@@ -149,14 +198,59 @@ func (s *Service) waitForPublicAddr() {
 	}
 	s.holePuncher = newHolePuncher(s.host, s.ids, s.listenAddrs, s.tracer, s.filter)
 	s.holePuncher.directDialTimeout = s.directDialTimeout
+	s.holePuncher.natDetector = s.natDetector
 	s.holePuncherMx.Unlock()
 	close(s.hasPublicAddrsChan)
+}
+
+// watchAddressChanges listens for local address changes (e.g. network switch
+// on mobile/WiFi) and invalidates the NAT cache so the next hole punch
+// re-detects the NAT type.
+func (s *Service) watchAddressChanges() {
+	defer s.refCount.Done()
+	sub := s.addrSub
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case e, ok := <-sub.Out():
+			if !ok {
+				return
+			}
+			evt, _ := e.(event.EvtLocalAddressesUpdated)
+			hasNew := false
+			if evt.Diffs {
+				for _, a := range evt.Current {
+					if a.Action == event.Added {
+						hasNew = true
+						break
+					}
+				}
+				if len(evt.Removed) > 0 {
+					hasNew = true
+				}
+			} else {
+				// No diff info available; conservatively invalidate
+				hasNew = true
+			}
+			if hasNew {
+				log.Debug("local addresses changed, invalidating NAT cache")
+				s.natDetector.Invalidate()
+			}
+		}
+	}
 }
 
 // Close closes the Hole Punch Service.
 func (s *Service) Close() error {
 	var err error
 	s.ctxCancel()
+	if s.addrSub != nil {
+		s.addrSub.Close()
+	}
+	if s.natDetector != nil {
+		s.natDetector.Close()
+	}
 	s.holePuncherMx.Lock()
 	if s.holePuncher != nil {
 		err = s.holePuncher.Close()
@@ -164,6 +258,7 @@ func (s *Service) Close() error {
 	s.holePuncherMx.Unlock()
 	s.tracer.Close()
 	s.host.RemoveStreamHandler(Protocol)
+	s.host.RemoveStreamHandler(ProtocolV2)
 	s.refCount.Wait()
 	return err
 }
@@ -286,4 +381,19 @@ func (s *Service) DirectConnect(p peer.ID) error {
 	holePuncher := s.holePuncher
 	s.holePuncherMx.Unlock()
 	return holePuncher.DirectConnect(p)
+}
+
+// NATType returns the most recently detected NAT type.
+// Returns NATUnknown if v2 is not enabled or detection hasn't completed.
+func (s *Service) NATType() NATType {
+	if s.natDetector == nil {
+		return NATUnknown
+	}
+	return s.natDetector.NATType()
+}
+
+// NATDetector returns the NAT detector, or nil if v2 is not enabled.
+// This can be used for advanced queries like checking STUN availability.
+func (s *Service) GetNATDetector() *NATDetector {
+	return s.natDetector
 }

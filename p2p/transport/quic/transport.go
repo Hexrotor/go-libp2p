@@ -109,6 +109,14 @@ func (t *transport) ListenOrder() int {
 
 // Dial dials a new QUIC connection
 func (t *transport) Dial(ctx context.Context, raddr ma.Multiaddr, p peer.ID) (_c tpt.CapableConn, _err error) {
+	// Check for pre-punched socket from DCUtR v2
+	if punchedInfo := network.GetPunchedSocket(ctx); punchedInfo != nil {
+		if ok, isClient, _ := network.GetSimultaneousConnect(ctx); ok && !isClient {
+			return t.acceptOnPunchedSocket(ctx, raddr, p, punchedInfo)
+		}
+		return t.dialWithPunchedSocket(ctx, raddr, p, punchedInfo)
+	}
+
 	if ok, isClient, _ := network.GetSimultaneousConnect(ctx); ok && !isClient {
 		return t.holePunch(ctx, raddr, p)
 	}
@@ -342,6 +350,180 @@ func (t *transport) Listen(addr ma.Multiaddr) (tpt.Listener, error) {
 	t.listeners[udpAddr.String()] = listeners
 
 	return l, nil
+}
+
+// punchedSocketQuicConfig returns a QUIC config for connections on punched sockets.
+func punchedSocketQuicConfig() *quic.Config {
+	return &quic.Config{
+		MaxIncomingStreams:                256,
+		MaxIncomingUniStreams:             5,
+		MaxStreamReceiveWindow:           10 * (1 << 20), // 10 MB
+		MaxConnectionReceiveWindow:       15 * (1 << 20), // 15 MB
+		KeepAlivePeriod:                  15 * time.Second,
+		Versions:                         []quic.Version{quic.Version1},
+		EnableDatagrams:                  true,
+		EnableStreamResetPartialDelivery: true,
+	}
+}
+
+// dialWithPunchedSocket dials a QUIC connection using a pre-punched UDP socket
+// from DCUtR v2 hole punching. The caller (client role) initiates the QUIC handshake.
+func (t *transport) dialWithPunchedSocket(ctx context.Context, raddr ma.Multiaddr, p peer.ID, punchedInfo *network.PunchedSocketInfo) (tpt.CapableConn, error) {
+	scope, err := t.rcmgr.OpenConnection(network.DirOutbound, false, raddr)
+	if err != nil {
+		log.Debug("resource manager blocked outgoing connection", "peer", p, "addr", raddr, "err", err)
+		return nil, err
+	}
+	if err := scope.SetPeer(p); err != nil {
+		scope.Done()
+		log.Debug("resource manager blocked outgoing connection for peer", "peer", p, "addr", raddr, "err", err)
+		return nil, err
+	}
+
+	// Clear any stale deadlines from the punch phase
+	punchedInfo.Conn.SetDeadline(time.Time{})
+
+	// Create a standalone QUIC transport on the punched UDP socket
+	qtr := &quic.Transport{Conn: punchedInfo.Conn}
+	tlsConf, keyCh := t.identity.ConfigForPeer(p)
+	qconn, err := qtr.Dial(ctx, punchedInfo.RemoteAddr, tlsConf, punchedSocketQuicConfig())
+	if err != nil {
+		qtr.Close()
+		scope.Done()
+		return nil, fmt.Errorf("QUIC dial on punched socket: %w", err)
+	}
+
+	// Clean up the standalone QUIC transport when the connection closes
+	go func() {
+		<-qconn.Context().Done()
+		qtr.Close()
+	}()
+
+	// Should be ready by this point, don't block.
+	var remotePubKey ic.PubKey
+	select {
+	case remotePubKey = <-keyCh:
+	default:
+	}
+	if remotePubKey == nil {
+		qconn.CloseWithError(1, "")
+		scope.Done()
+		return nil, errors.New("p2p/transport/quic BUG: expected remote pub key to be set")
+	}
+
+	localMultiaddr, err := quicreuse.ToQuicMultiaddr(qconn.LocalAddr(), qconn.ConnectionState().Version)
+	if err != nil {
+		qconn.CloseWithError(1, "")
+		scope.Done()
+		return nil, err
+	}
+	c := &conn{
+		quicConn:        qconn,
+		transport:       t,
+		scope:           scope,
+		localPeer:       t.localPeer,
+		localMultiaddr:  localMultiaddr,
+		remotePubKey:    remotePubKey,
+		remotePeerID:    p,
+		remoteMultiaddr: raddr,
+	}
+	if t.gater != nil && !t.gater.InterceptSecured(network.DirOutbound, p, c) {
+		qconn.CloseWithError(quic.ApplicationErrorCode(network.ConnGated), "connection gated")
+		scope.Done()
+		return nil, fmt.Errorf("secured connection gated")
+	}
+	t.addConn(qconn, c)
+	return c, nil
+}
+
+// acceptOnPunchedSocket accepts a QUIC connection on a pre-punched UDP socket
+// from DCUtR v2 hole punching. The caller (server role) waits for the remote
+// peer to initiate the QUIC handshake.
+func (t *transport) acceptOnPunchedSocket(ctx context.Context, raddr ma.Multiaddr, p peer.ID, punchedInfo *network.PunchedSocketInfo) (tpt.CapableConn, error) {
+	// Clear any stale deadlines from the punch phase
+	punchedInfo.Conn.SetDeadline(time.Time{})
+
+	// Create a standalone QUIC transport on the punched UDP socket
+	qtr := &quic.Transport{Conn: punchedInfo.Conn}
+
+	// Server-side TLS config: accept any peer, verify identity after handshake
+	var tlsConf tls.Config
+	tlsConf.GetConfigForClient = func(_ *tls.ClientHelloInfo) (*tls.Config, error) {
+		conf, _ := t.identity.ConfigForPeer("")
+		return conf, nil
+	}
+	tlsConf.NextProtos = []string{"libp2p"}
+
+	ln, err := qtr.Listen(&tlsConf, punchedSocketQuicConfig())
+	if err != nil {
+		qtr.Close()
+		return nil, fmt.Errorf("QUIC listen on punched socket: %w", err)
+	}
+	qconn, err := ln.Accept(ctx)
+	ln.Close() // Stop accepting further connections
+	if err != nil {
+		qtr.Close()
+		return nil, fmt.Errorf("QUIC accept on punched socket: %w", err)
+	}
+
+	// Clean up the standalone QUIC transport when the connection closes
+	go func() {
+		<-qconn.Context().Done()
+		qtr.Close()
+	}()
+
+	// Extract and verify peer identity from TLS certificate chain
+	remotePubKey, err := p2ptls.PubKeyFromCertChain(qconn.ConnectionState().TLS.PeerCertificates)
+	if err != nil {
+		qconn.CloseWithError(1, "")
+		return nil, fmt.Errorf("failed to extract public key from punched socket conn: %w", err)
+	}
+	remotePeerID, err := peer.IDFromPublicKey(remotePubKey)
+	if err != nil {
+		qconn.CloseWithError(1, "")
+		return nil, fmt.Errorf("failed to derive peer ID: %w", err)
+	}
+	if remotePeerID != p {
+		qconn.CloseWithError(1, "peer ID mismatch")
+		return nil, fmt.Errorf("peer ID mismatch on punched socket: expected %s, got %s", p, remotePeerID)
+	}
+
+	scope, err := t.rcmgr.OpenConnection(network.DirInbound, false, raddr)
+	if err != nil {
+		qconn.CloseWithError(1, "")
+		log.Debug("resource manager blocked incoming connection", "peer", p, "addr", raddr, "err", err)
+		return nil, err
+	}
+	if err := scope.SetPeer(p); err != nil {
+		qconn.CloseWithError(1, "")
+		scope.Done()
+		log.Debug("resource manager blocked incoming connection for peer", "peer", p, "addr", raddr, "err", err)
+		return nil, err
+	}
+
+	localMultiaddr, err := quicreuse.ToQuicMultiaddr(qconn.LocalAddr(), qconn.ConnectionState().Version)
+	if err != nil {
+		qconn.CloseWithError(1, "")
+		scope.Done()
+		return nil, err
+	}
+	c := &conn{
+		quicConn:        qconn,
+		transport:       t,
+		scope:           scope,
+		localPeer:       t.localPeer,
+		localMultiaddr:  localMultiaddr,
+		remotePubKey:    remotePubKey,
+		remotePeerID:    remotePeerID,
+		remoteMultiaddr: raddr,
+	}
+	if t.gater != nil && !(t.gater.InterceptAccept(c) && t.gater.InterceptSecured(network.DirInbound, remotePeerID, c)) {
+		qconn.CloseWithError(quic.ApplicationErrorCode(network.ConnGated), "connection gated")
+		scope.Done()
+		return nil, fmt.Errorf("secured connection gated")
+	}
+	t.addConn(qconn, c)
+	return c, nil
 }
 
 func (t *transport) allowWindowIncrease(conn *quic.Conn, size uint64) bool {

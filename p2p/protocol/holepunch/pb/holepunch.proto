@@ -11,6 +11,22 @@ message HolePunch {
     SYNC = 300;
   }
 
-  required Type type=1;
+  // NAT type classification (v2 extension)
+  enum NATType {
+    NAT_UNKNOWN            = 0;
+    NAT_OPEN               = 1;
+    NAT_CONE               = 2;
+    NAT_SYMMETRIC_EASY_INC = 3;
+    NAT_SYMMETRIC_EASY_DEC = 4;
+    NAT_SYMMETRIC_HARD     = 5;
+  }
+
+  required Type type = 1;
   repeated bytes ObsAddrs = 2;
+
+  // v2 extensions (optional — ignored by v1 peers)
+  optional NATType natType    = 3;  // sender's NAT classification
+  repeated bytes   PunchAddrs = 4;  // punch socket's public address (STUN-queried)
+  optional uint32  publicPort = 5;  // latest observed port (for EasySym prediction)
+  optional uint32  tid        = 6;  // punch transaction ID (in SYNC message)
 }
