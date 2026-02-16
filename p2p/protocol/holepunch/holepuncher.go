@@ -142,7 +142,14 @@ func (hp *holePuncher) directConnect(rp peer.ID) error {
 			hp.tracer.HolePunchFinished("initiator-v2", 1, nil, nil, getDirectConnection(hp.host, rp))
 			return nil
 		}
-		log.Debug("v2 hole punch failed, falling back to v1", "peer", rp, "err", err)
+		// Only fall back to v1 if the remote peer doesn't support v2.
+		// If v2 was negotiated but the punch failed, don't fall back —
+		// v2 covers all v1 scenarios, so a v1 retry would be redundant.
+		if !errors.Is(err, ErrV2NotSupported) {
+			log.Debug("v2 hole punch failed", "peer", rp, "err", err)
+			return err
+		}
+		log.Debug("remote peer does not support v2, falling back to v1", "peer", rp, "err", err)
 	}
 
 	// v1 hole punch

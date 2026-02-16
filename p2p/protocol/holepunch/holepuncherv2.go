@@ -16,16 +16,21 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
+// ErrV2NotSupported is returned when the remote peer does not support
+// the DCUtR v2 protocol. The caller should fall back to v1.
+var ErrV2NotSupported = errors.New("remote peer does not support DCUtR v2")
+
 // directConnectV2 attempts a DCUtR v2 hole punch with the remote peer.
 // It opens a v2 stream, exchanges NAT info, performs UDP-level punching
 // (or standard simultaneous connect for ConeToCone), then establishes
 // a direct connection.
+// Returns ErrV2NotSupported if the remote peer doesn't support the v2 protocol.
 func (hp *holePuncher) directConnectV2(rp peer.ID) error {
 	hpCtx := network.WithAllowLimitedConn(hp.ctx, "hole-punch-v2")
 	sCtx := network.WithNoDial(hpCtx, "hole-punch-v2")
 	str, err := hp.host.NewStream(sCtx, rp, ProtocolV2)
 	if err != nil {
-		return fmt.Errorf("v2 stream: %w", err)
+		return fmt.Errorf("%w: %w", ErrV2NotSupported, err)
 	}
 	defer str.Close()
 
