@@ -204,6 +204,14 @@ func (s *Service) incomingHolePunchV2(str network.Stream) (rtt time.Duration, pu
 		port := uint32(punchInfo.PublicPort)
 		respMsg.PublicPort = &port
 	} else {
+		// No punch socket (e.g. Symmetric side), but still include detected
+		// public IP so the peer can target us correctly for birthday attack.
+		if myNAT.PublicIP != "" && myNAT.PublicPort > 0 {
+			punchMA, _ := ma.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%d/quic-v1", myNAT.PublicIP, myNAT.PublicPort))
+			if punchMA != nil {
+				respMsg.PunchAddrs = addrsToBytes([]ma.Multiaddr{punchMA})
+			}
+		}
 		port := uint32(myNAT.PublicPort)
 		respMsg.PublicPort = &port
 	}

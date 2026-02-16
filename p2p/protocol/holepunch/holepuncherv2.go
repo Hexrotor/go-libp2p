@@ -152,6 +152,14 @@ func (hp *holePuncher) initiateHolePunchV2(str network.Stream, rp peer.ID) (*Pun
 		port := uint32(punchInfo.PublicPort)
 		connectMsg.PublicPort = &port
 	} else {
+		// No punch socket (e.g. Symmetric side), but still include detected
+		// public IP so the peer can target us correctly for birthday attack.
+		if myNAT.PublicIP != "" && myNAT.PublicPort > 0 {
+			punchMA, _ := ma.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%d/quic-v1", myNAT.PublicIP, myNAT.PublicPort))
+			if punchMA != nil {
+				connectMsg.PunchAddrs = addrsToBytes([]ma.Multiaddr{punchMA})
+			}
+		}
 		port := uint32(myNAT.PublicPort)
 		connectMsg.PublicPort = &port
 	}
