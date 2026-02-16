@@ -387,6 +387,11 @@ func (h *BasicHost) EventBus() event.Bus {
 	return h.eventbus
 }
 
+// HolePunchService returns the hole punch service, or nil if not enabled.
+func (h *BasicHost) HolePunchService() *holepunch.Service {
+	return h.hps
+}
+
 // SetStreamHandler sets the protocol handler on the Host's Mux.
 // This is equivalent to:
 //
