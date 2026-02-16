@@ -439,10 +439,11 @@ func (d *NATDetector) Detect() (*NATInfo, error) {
 	if d.host != nil {
 		info, err := d.detectFromObservations()
 		if err == nil {
-			// Observations can reliably distinguish Cone vs Symmetric, but
-			// cannot determine Symmetric sub-types (EasyInc/EasyDec/Hard).
-			// If STUN is available, refine the sub-type for Symmetric NATs.
-			if info.Type.IsSymmetric() && len(d.stunServers) >= 2 {
+			// Observations now classify sub-types via time-series analysis.
+			// Only use STUN refinement if observations couldn't determine the
+			// sub-type (returned Hard) and STUN is available — STUN's controlled
+			// single-socket probing is more precise for borderline cases.
+			if info.Type == NATSymmetricHard && len(d.stunServers) >= 2 {
 				stunInfo, stunErr := DetectNAT(d.stunServers)
 				if stunErr == nil && stunInfo.Type.IsSymmetric() {
 					log.Debug("STUN refined Symmetric sub-type",
@@ -557,22 +558,93 @@ func (d *NATDetector) detectFromObservations() (*NATInfo, error) {
 		}
 
 		// Ports differ → Symmetric NAT.
-		// Without STUN's controlled single-socket probing, we cannot reliably
-		// determine EasyInc vs EasyDec vs Hard. Default to HardSym which is
-		// safe — birthday attack works for all symmetric sub-types.
+		// Analyze the time-ordered port sequence to determine sub-type.
+		natType := classifySymmetricSubtype(peerObs)
+
+		// For predictable NATs, use the latest observed port as the base
+		// for port prediction (it's closest to the next allocation).
+		publicPort := latestObservedPort(peerObs)
+
 		sort.Ints(ports)
 		info := &NATInfo{
-			Type:       NATSymmetricHard,
+			Type:       natType,
 			PublicIP:   ip,
-			PublicPort: ports[len(ports)-1],
+			PublicPort: publicPort,
 		}
 		log.Debug("NAT detected from observations", "type", info.Type,
-			"public_ip", ip, "observed_ports", ports, "local_port", localPort,
-			"observers", len(peerObs))
+			"public_ip", ip, "observed_ports", ports, "latest_port", publicPort,
+			"local_port", localPort, "observers", len(peerObs))
 		return info, nil
 	}
 
 	return nil, fmt.Errorf("need observations from 2+ peers on same local port, have %d total", len(snapshot))
+}
+
+// classifySymmetricSubtype determines the Symmetric NAT sub-type by analyzing
+// the time-ordered sequence of observed ports. If ports are monotonically
+// trending in one direction, it's an "easy" (predictable) symmetric NAT.
+//
+// Algorithm:
+//   - Sort observations by timestamp
+//   - Compute consecutive port differences
+//   - If ≥75% of differences are positive → EasyInc
+//   - If ≥75% of differences are negative → EasyDec
+//   - Otherwise → Hard (random allocation)
+//
+// Requires at least 3 observations for meaningful trend analysis.
+func classifySymmetricSubtype(peerObs map[peer.ID]natObservation) NATType {
+	if len(peerObs) < 3 {
+		return NATSymmetricHard
+	}
+
+	// Collect and sort by timestamp
+	obs := make([]natObservation, 0, len(peerObs))
+	for _, o := range peerObs {
+		obs = append(obs, o)
+	}
+	sort.Slice(obs, func(i, j int) bool {
+		return obs[i].at.Before(obs[j].at)
+	})
+
+	positive := 0
+	negative := 0
+	for i := 1; i < len(obs); i++ {
+		diff := obs[i].observedPort - obs[i-1].observedPort
+		if diff > 0 {
+			positive++
+		} else if diff < 0 {
+			negative++
+		}
+		// diff == 0: same port, doesn't count either way
+	}
+
+	total := positive + negative
+	if total == 0 {
+		// All ports identical — shouldn't reach here (caller checks allSame),
+		// but treat as Cone-like behavior.
+		return NATSymmetricHard
+	}
+
+	ratio := float64(positive) / float64(total)
+	if ratio >= 0.75 {
+		return NATSymmetricEasyInc
+	}
+	if ratio <= 0.25 { // 75%+ negative
+		return NATSymmetricEasyDec
+	}
+	return NATSymmetricHard
+}
+
+// latestObservedPort returns the observed port from the most recent observation.
+// For predictable NATs, this is the best base for port prediction.
+func latestObservedPort(peerObs map[peer.ID]natObservation) int {
+	var latest natObservation
+	for _, o := range peerObs {
+		if latest.at.IsZero() || o.at.After(latest.at) {
+			latest = o
+		}
+	}
+	return latest.observedPort
 }
 
 // Invalidate clears the cached result and observations so the next
