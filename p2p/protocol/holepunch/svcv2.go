@@ -30,7 +30,7 @@ func (s *Service) handleNewStreamV2(str network.Stream) {
 	}
 
 	rp := str.Conn().RemotePeer()
-	rtt, punchedSock, ownAddrs, err := s.incomingHolePunchV2(str)
+	rtt, punchedSock, ownAddrs, peerAddrs, err := s.incomingHolePunchV2(str)
 	if err != nil {
 		s.tracer.ProtocolError(rp, err)
 		log.Debug("error handling v2 holepunching stream", "peer", rp, "err", err)
@@ -39,52 +39,73 @@ func (s *Service) handleNewStreamV2(str network.Stream) {
 	}
 	str.Close()
 
-	if punchedSock == nil {
-		log.Debug("v2 hole punch: no punched socket", "peer", rp)
+	if punchedSock != nil {
+		// Got a punched UDP socket → establish QUIC on it
+		remoteMA, err := udpAddrToQuicMultiaddr(punchedSock.RemoteAddr)
+		if err != nil {
+			punchedSock.Conn.Close()
+			log.Debug("v2 bad remote addr", "peer", rp, "err", err)
+			return
+		}
+
+		punchCtx := network.WithPunchedSocket(s.ctx, &network.PunchedSocketInfo{
+			Conn:       punchedSock.Conn,
+			RemoteAddr: punchedSock.RemoteAddr,
+		})
+
+		pi := peer.AddrInfo{
+			ID:    rp,
+			Addrs: []ma.Multiaddr{remoteMA},
+		}
+		s.tracer.StartHolePunch(rp, pi.Addrs, rtt)
+		log.Debug("v2 starting QUIC on punched socket", "peer", rp)
+		start := time.Now()
+		s.tracer.HolePunchAttempt(pi.ID)
+		ctx, cancel := context.WithTimeout(punchCtx, s.directDialTimeout)
+		err = holePunchConnect(ctx, s.host, pi, false) // receiver = QUIC server
+		cancel()
+		dt := time.Since(start)
+		s.tracer.EndHolePunch(rp, dt, err)
+
+		if err != nil {
+			punchedSock.Conn.Close()
+			log.Debug("v2 QUIC on punched socket failed", "peer", rp, "err", err)
+		}
+		s.tracer.HolePunchFinished("receiver-v2", 1, pi.Addrs, ownAddrs, getDirectConnection(s.host, rp))
 		return
 	}
 
-	// Establish QUIC connection on the punched socket
-	remoteMA, err := udpAddrToQuicMultiaddr(punchedSock.RemoteAddr)
-	if err != nil {
-		punchedSock.Conn.Close()
-		log.Debug("v2 bad remote addr", "peer", rp, "err", err)
+	// ConeToCone path: no UDP punch needed, use standard simultaneous connect
+	if len(peerAddrs) > 0 {
+		pi := peer.AddrInfo{ID: rp, Addrs: peerAddrs}
+		s.tracer.StartHolePunch(rp, peerAddrs, rtt)
+		log.Debug("v2 ConeToCone simultaneous connect (receiver)", "peer", rp, "addrs", peerAddrs)
+		start := time.Now()
+		s.tracer.HolePunchAttempt(rp)
+		ctx, cancel := context.WithTimeout(s.ctx, s.directDialTimeout)
+		err = holePunchConnect(ctx, s.host, pi, false) // receiver = QUIC server
+		cancel()
+		dt := time.Since(start)
+		s.tracer.EndHolePunch(rp, dt, err)
+
+		if err != nil {
+			log.Debug("v2 ConeToCone connect failed (receiver)", "peer", rp, "err", err)
+		}
+		s.tracer.HolePunchFinished("receiver-v2", 1, peerAddrs, ownAddrs, getDirectConnection(s.host, rp))
 		return
 	}
 
-	punchCtx := network.WithPunchedSocket(s.ctx, &network.PunchedSocketInfo{
-		Conn:       punchedSock.Conn,
-		RemoteAddr: punchedSock.RemoteAddr,
-	})
-
-	pi := peer.AddrInfo{
-		ID:    rp,
-		Addrs: []ma.Multiaddr{remoteMA},
-	}
-	s.tracer.StartHolePunch(rp, pi.Addrs, rtt)
-	log.Debug("v2 starting QUIC on punched socket", "peer", rp)
-	start := time.Now()
-	s.tracer.HolePunchAttempt(pi.ID)
-	ctx, cancel := context.WithTimeout(punchCtx, s.directDialTimeout)
-	err = holePunchConnect(ctx, s.host, pi, false) // receiver = QUIC server
-	cancel()
-	dt := time.Since(start)
-	s.tracer.EndHolePunch(rp, dt, err)
-
-	if err != nil {
-		punchedSock.Conn.Close()
-		log.Debug("v2 QUIC on punched socket failed", "peer", rp, "err", err)
-	}
-	s.tracer.HolePunchFinished("receiver-v2", 1, pi.Addrs, ownAddrs, getDirectConnection(s.host, rp))
+	log.Debug("v2 hole punch: no punched socket and no peer addresses", "peer", rp)
 }
 
 // incomingHolePunchV2 handles the v2 protocol exchange from the receiver side.
 // It reads the initiator's CONNECT, responds with its own NAT info,
-// reads SYNC with TID, then executes the UDP punch.
-func (s *Service) incomingHolePunchV2(str network.Stream) (rtt time.Duration, punchedSock *PunchedSocket, ownAddrs []ma.Multiaddr, err error) {
+// reads SYNC with TID, then executes the UDP punch (or skips it for ConeToCone).
+// Returns: rtt, punched socket (nil for ConeToCone), own addrs, peer's addrs, error.
+func (s *Service) incomingHolePunchV2(str network.Stream) (rtt time.Duration, punchedSock *PunchedSocket, ownAddrs []ma.Multiaddr, peerAddrs []ma.Multiaddr, err error) {
 	// Sanity check: hole punch request should come from peers behind a relay
 	if !isRelayAddress(str.Conn().RemoteMultiaddr()) {
-		return 0, nil, nil, fmt.Errorf("received v2 hole punch from non-relay: %s", str.Conn().RemoteMultiaddr())
+		return 0, nil, nil, nil, fmt.Errorf("received v2 hole punch from non-relay: %s", str.Conn().RemoteMultiaddr())
 	}
 
 	ownAddrs = s.listenAddrs()
@@ -92,11 +113,11 @@ func (s *Service) incomingHolePunchV2(str network.Stream) (rtt time.Duration, pu
 		ownAddrs = s.filter.FilterLocal(str.Conn().RemotePeer(), ownAddrs)
 	}
 	if len(ownAddrs) == 0 {
-		return 0, nil, nil, errors.New("rejecting v2 hole punch: no public addresses")
+		return 0, nil, nil, nil, errors.New("rejecting v2 hole punch: no public addresses")
 	}
 
 	if err := str.Scope().ReserveMemory(maxMsgSize, network.ReservationPriorityAlways); err != nil {
-		return 0, nil, nil, fmt.Errorf("error reserving memory: %w", err)
+		return 0, nil, nil, nil, fmt.Errorf("error reserving memory: %w", err)
 	}
 	defer str.Scope().ReleaseMemory(maxMsgSize)
 
@@ -107,10 +128,10 @@ func (s *Service) incomingHolePunchV2(str network.Stream) (rtt time.Duration, pu
 	// Read CONNECT from initiator
 	var msg pb.HolePunch
 	if err := rd.ReadMsg(&msg); err != nil {
-		return 0, nil, nil, fmt.Errorf("failed to read CONNECT from initiator: %w", err)
+		return 0, nil, nil, nil, fmt.Errorf("failed to read CONNECT from initiator: %w", err)
 	}
 	if msg.GetType() != pb.HolePunch_CONNECT {
-		return 0, nil, nil, fmt.Errorf("expected CONNECT, got %s", msg.GetType())
+		return 0, nil, nil, nil, fmt.Errorf("expected CONNECT, got %s", msg.GetType())
 	}
 
 	// Extract initiator's NAT info
@@ -139,17 +160,20 @@ func (s *Service) incomingHolePunchV2(str network.Stream) (rtt time.Duration, pu
 		}
 	}
 
+	// Collect initiator's observed addresses for ConeToCone fallback
+	initiatorObsAddrs := removeRelayAddrs(addrsFromBytes(msg.GetObsAddrs()))
+
 	log.Debug("v2 received CONNECT", "peer", str.Conn().RemotePeer(),
 		"initiator_nat", initiatorNATType, "initiator_ip", initiatorNAT.PublicIP,
 		"initiator_port", initiatorNAT.PublicPort)
 
 	// Detect own NAT
 	if s.natDetector == nil {
-		return 0, nil, nil, errors.New("v2 hole punch: NAT detector not configured")
+		return 0, nil, nil, nil, errors.New("v2 hole punch: NAT detector not configured")
 	}
 	myNAT, err := s.natDetector.Detect()
 	if err != nil {
-		return 0, nil, nil, fmt.Errorf("NAT detection failed: %w", err)
+		return 0, nil, nil, nil, fmt.Errorf("NAT detection failed: %w", err)
 	}
 
 	// Create punch socket if Cone and STUN is available
@@ -187,19 +211,19 @@ func (s *Service) incomingHolePunchV2(str network.Stream) (rtt time.Duration, pu
 	tstart := time.Now()
 	if err := wr.WriteMsg(respMsg); err != nil {
 		closePunchSock(punchSock)
-		return 0, nil, nil, fmt.Errorf("failed to send CONNECT response: %w", err)
+		return 0, nil, nil, nil, fmt.Errorf("failed to send CONNECT response: %w", err)
 	}
 
 	// Read SYNC from initiator
 	msg.Reset()
 	if err := rd.ReadMsg(&msg); err != nil {
 		closePunchSock(punchSock)
-		return 0, nil, nil, fmt.Errorf("failed to read SYNC: %w", err)
+		return 0, nil, nil, nil, fmt.Errorf("failed to read SYNC: %w", err)
 	}
 	rtt = time.Since(tstart)
 	if msg.GetType() != pb.HolePunch_SYNC {
 		closePunchSock(punchSock)
-		return 0, nil, nil, fmt.Errorf("expected SYNC, got %s", msg.GetType())
+		return 0, nil, nil, nil, fmt.Errorf("expected SYNC, got %s", msg.GetType())
 	}
 	tid := msg.GetTid()
 
@@ -207,12 +231,20 @@ func (s *Service) incomingHolePunchV2(str network.Stream) (rtt time.Duration, pu
 	method := DeterminePunchMethod(initiatorNATType, myNAT.Type)
 	if method == PunchNone {
 		closePunchSock(punchSock)
-		return rtt, nil, ownAddrs, fmt.Errorf("no viable punch method for %s <-> %s", initiatorNATType, myNAT.Type)
+		return rtt, nil, ownAddrs, nil, fmt.Errorf("no viable punch method for %s <-> %s", initiatorNATType, myNAT.Type)
 	}
 
 	log.Debug("v2 receiver punch", "peer", str.Conn().RemotePeer(),
 		"my_nat", myNAT.Type, "initiator_nat", initiatorNATType,
 		"method", method, "tid", tid, "rtt", rtt)
+
+	// ConeToCone without punch socket: skip UDP punch, return initiator's addrs
+	// for standard simultaneous connect
+	if method == PunchConeToCone && punchSock == nil {
+		log.Debug("v2 ConeToCone without punch socket, using simultaneous connect (receiver)",
+			"peer", str.Conn().RemotePeer(), "initiator_addrs", initiatorObsAddrs)
+		return rtt, nil, ownAddrs, initiatorObsAddrs, nil
+	}
 
 	// Execute UDP punch
 	punchCtx, cancel := context.WithTimeout(s.ctx, PunchTimeout)
@@ -221,8 +253,8 @@ func (s *Service) incomingHolePunchV2(str network.Stream) (rtt time.Duration, pu
 	punched, err := ExecutePunch(punchCtx, myNAT, initiatorNAT, method, tid, punchSock)
 	if err != nil {
 		closePunchSock(punchSock)
-		return rtt, nil, ownAddrs, fmt.Errorf("UDP punch failed: %w", err)
+		return rtt, nil, ownAddrs, nil, fmt.Errorf("UDP punch failed: %w", err)
 	}
 
-	return rtt, punched, ownAddrs, nil
+	return rtt, punched, ownAddrs, nil, nil
 }
