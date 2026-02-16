@@ -439,11 +439,11 @@ func (d *NATDetector) Detect() (*NATInfo, error) {
 	if d.host != nil {
 		info, err := d.detectFromObservations()
 		if err == nil {
-			// Observations now classify sub-types via time-series analysis.
-			// Only use STUN refinement if observations couldn't determine the
-			// sub-type (returned Hard) and STUN is available — STUN's controlled
-			// single-socket probing is more precise for borderline cases.
-			if info.Type == NATSymmetricHard && len(d.stunServers) >= 2 {
+			// Use STUN to refine Symmetric sub-type when available.
+			// Observation-based direction detection (Kendall tau on identify
+			// timestamps) can be inaccurate due to timestamp jitter. STUN's
+			// controlled single-socket sequential probing is authoritative.
+			if info.Type.IsSymmetric() && len(d.stunServers) >= 2 {
 				stunInfo, stunErr := DetectNAT(d.stunServers)
 				if stunErr == nil && stunInfo.Type.IsSymmetric() {
 					log.Debug("STUN refined Symmetric sub-type",
@@ -585,11 +585,11 @@ func (d *NATDetector) detectFromObservations() (*NATInfo, error) {
 //
 //  1. Range/count ratio: sequential allocation produces narrow port ranges
 //     (ratio < 30), while random allocation produces wide ranges (ratio >> 30).
-//  2. Direction: for narrow ranges, split observations by time into early/late
-//     halves and compare average ports to determine Inc vs Dec.
-//
-// This approach is robust against identify-event timing jitter, which makes
-// pure timestamp-ordered analysis unreliable.
+//  2. Direction: for narrow ranges, use Kendall tau sign (concordant vs
+//     discordant pair counting) between timestamps and port values.
+//     This is more robust than early/late averages because it uses all
+//     O(n²) observation pairs, reducing sensitivity to timestamp jitter
+//     from identify event completion delays.
 func classifySymmetricSubtype(peerObs map[peer.ID]natObservation) NATType {
 	if len(peerObs) < 3 {
 		return NATSymmetricHard
@@ -626,23 +626,28 @@ func classifySymmetricSubtype(peerObs map[peer.ID]natObservation) NATType {
 	}
 
 	// Ports are in a narrow band → sequential (predictable) allocation.
-	// Determine direction by comparing early vs late observation averages.
-	sort.Slice(obs, func(i, j int) bool {
-		return obs[i].at.Before(obs[j].at)
-	})
-
-	mid := len(obs) / 2
-	earlySum, lateSum := 0, 0
-	for i := 0; i < mid; i++ {
-		earlySum += obs[i].observedPort
+	// Determine direction using Kendall tau sign: count concordant pairs
+	// (time↑ port↑) vs discordant pairs (time↑ port↓) across all
+	// observation pairs. This is robust against identify-event timing
+	// jitter because individual noisy pairs are outvoted by the majority.
+	concordant, discordant := 0, 0
+	for i := 0; i < len(obs); i++ {
+		for j := i + 1; j < len(obs); j++ {
+			timeDiff := obs[j].at.Sub(obs[i].at)
+			portDiff := obs[j].observedPort - obs[i].observedPort
+			if timeDiff > 0 && portDiff > 0 || timeDiff < 0 && portDiff < 0 {
+				concordant++
+			} else if timeDiff > 0 && portDiff < 0 || timeDiff < 0 && portDiff > 0 {
+				discordant++
+			}
+			// ties (timeDiff == 0 or portDiff == 0) are ignored
+		}
 	}
-	for i := mid; i < len(obs); i++ {
-		lateSum += obs[i].observedPort
-	}
-	earlyAvg := float64(earlySum) / float64(mid)
-	lateAvg := float64(lateSum) / float64(len(obs)-mid)
 
-	if lateAvg > earlyAvg {
+	log.Debug("Symmetric sub-type Kendall tau",
+		"concordant", concordant, "discordant", discordant, "observations", len(obs))
+
+	if concordant >= discordant {
 		return NATSymmetricEasyInc
 	}
 	return NATSymmetricEasyDec
