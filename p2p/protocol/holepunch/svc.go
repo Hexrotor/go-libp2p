@@ -64,11 +64,12 @@ func WithSTUNServers(servers []string) Option {
 }
 
 // EnableV2 enables DCUtR v2 hole punching using ObservedAddr-based NAT
-// detection from existing connections. No external STUN servers are required.
-// For more precise NAT sub-type classification, use WithSTUNServers instead.
+// detection from existing connections. Default public STUN servers are included
+// for creating punch sockets (required for Cone-to-Symmetric NAT traversal).
+// To override the STUN servers, call WithSTUNServers after EnableV2.
 func EnableV2() Option {
 	return func(s *Service) error {
-		s.natDetector = NewNATDetector(s.host, nil, 0)
+		s.natDetector = NewNATDetector(s.host, DefaultSTUNServers, 0)
 		return nil
 	}
 }

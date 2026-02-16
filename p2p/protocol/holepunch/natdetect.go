@@ -439,6 +439,19 @@ func (d *NATDetector) Detect() (*NATInfo, error) {
 	if d.host != nil {
 		info, err := d.detectFromObservations()
 		if err == nil {
+			// Observations can reliably distinguish Cone vs Symmetric, but
+			// cannot determine Symmetric sub-types (EasyInc/EasyDec/Hard).
+			// If STUN is available, refine the sub-type for Symmetric NATs.
+			if info.Type.IsSymmetric() && len(d.stunServers) >= 2 {
+				stunInfo, stunErr := DetectNAT(d.stunServers)
+				if stunErr == nil && stunInfo.Type.IsSymmetric() {
+					log.Debug("STUN refined Symmetric sub-type",
+						"obs_type", info.Type, "stun_type", stunInfo.Type,
+						"stun_port", stunInfo.PublicPort)
+					info.Type = stunInfo.Type
+					info.PublicPort = stunInfo.PublicPort
+				}
+			}
 			d.cachedInfo = info
 			d.cachedErr = nil
 			d.cachedAt = time.Now()
