@@ -248,11 +248,12 @@ func (hp *holePuncher) initiateHolePunchV2(str network.Stream, rp peer.ID) (*Pun
 		return nil, rtt, nil, hp.ctx.Err()
 	}
 
-	// ConeToCone without punch socket: skip UDP punch, return peer addrs
-	// for standard simultaneous connect (both sides have endpoint-independent
-	// mapping, so standard QUIC dial works)
-	if method == PunchConeToCone && punchSock == nil {
-		log.Debug("v2 ConeToCone without punch socket, using simultaneous connect",
+	// ConeToCone: always use standard simultaneous QUIC connect.
+	// Both sides have endpoint-independent mapping, so raw UDP punch is
+	// unnecessary and adds timing complexity. Close punch socket if present.
+	if method == PunchConeToCone {
+		closePunchSock(punchSock)
+		log.Debug("v2 ConeToCone using simultaneous connect",
 			"peer", rp, "peer_addrs", peerObsAddrs)
 		return nil, rtt, peerObsAddrs, nil
 	}

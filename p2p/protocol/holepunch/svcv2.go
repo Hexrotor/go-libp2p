@@ -246,10 +246,12 @@ func (s *Service) incomingHolePunchV2(str network.Stream) (rtt time.Duration, pu
 		"my_nat", myNAT.Type, "initiator_nat", initiatorNATType,
 		"method", method, "tid", tid, "rtt", rtt)
 
-	// ConeToCone without punch socket: skip UDP punch, return initiator's addrs
-	// for standard simultaneous connect
-	if method == PunchConeToCone && punchSock == nil {
-		log.Debug("v2 ConeToCone without punch socket, using simultaneous connect (receiver)",
+	// ConeToCone: always use standard simultaneous QUIC connect.
+	// Both sides have endpoint-independent mapping, so raw UDP punch is
+	// unnecessary and adds timing complexity. Close punch socket if present.
+	if method == PunchConeToCone {
+		closePunchSock(punchSock)
+		log.Debug("v2 ConeToCone using simultaneous connect (receiver)",
 			"peer", str.Conn().RemotePeer(), "initiator_addrs", initiatorObsAddrs)
 		return rtt, nil, ownAddrs, initiatorObsAddrs, nil
 	}
