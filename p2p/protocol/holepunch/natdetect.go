@@ -581,58 +581,71 @@ func (d *NATDetector) detectFromObservations() (*NATInfo, error) {
 }
 
 // classifySymmetricSubtype determines the Symmetric NAT sub-type by analyzing
-// the time-ordered sequence of observed ports. If ports are monotonically
-// trending in one direction, it's an "easy" (predictable) symmetric NAT.
+// the observed port distribution. Uses two metrics:
 //
-// Algorithm:
-//   - Sort observations by timestamp
-//   - Compute consecutive port differences
-//   - If ≥75% of differences are positive → EasyInc
-//   - If ≥75% of differences are negative → EasyDec
-//   - Otherwise → Hard (random allocation)
+//  1. Range/count ratio: sequential allocation produces narrow port ranges
+//     (ratio < 30), while random allocation produces wide ranges (ratio >> 30).
+//  2. Direction: for narrow ranges, split observations by time into early/late
+//     halves and compare average ports to determine Inc vs Dec.
 //
-// Requires at least 3 observations for meaningful trend analysis.
+// This approach is robust against identify-event timing jitter, which makes
+// pure timestamp-ordered analysis unreliable.
 func classifySymmetricSubtype(peerObs map[peer.ID]natObservation) NATType {
 	if len(peerObs) < 3 {
 		return NATSymmetricHard
 	}
 
-	// Collect and sort by timestamp
 	obs := make([]natObservation, 0, len(peerObs))
 	for _, o := range peerObs {
 		obs = append(obs, o)
 	}
+
+	// Find port range
+	minPort, maxPort := obs[0].observedPort, obs[0].observedPort
+	for _, o := range obs[1:] {
+		if o.observedPort < minPort {
+			minPort = o.observedPort
+		}
+		if o.observedPort > maxPort {
+			maxPort = o.observedPort
+		}
+	}
+
+	portRange := maxPort - minPort
+	if portRange == 0 {
+		return NATSymmetricHard // shouldn't happen (caller checks allSame)
+	}
+
+	// Sequential allocation: each connection increments port by 1-5, plus
+	// interleaved non-libp2p traffic adds gaps. Typical ratio: 3-20.
+	// Random allocation: ports scattered across 1-65535. Typical ratio: 500+.
+	// Threshold 30 accommodates heavy interleaved traffic on sequential NATs.
+	perObsRange := float64(portRange) / float64(len(obs))
+	if perObsRange > 30 {
+		return NATSymmetricHard
+	}
+
+	// Ports are in a narrow band → sequential (predictable) allocation.
+	// Determine direction by comparing early vs late observation averages.
 	sort.Slice(obs, func(i, j int) bool {
 		return obs[i].at.Before(obs[j].at)
 	})
 
-	positive := 0
-	negative := 0
-	for i := 1; i < len(obs); i++ {
-		diff := obs[i].observedPort - obs[i-1].observedPort
-		if diff > 0 {
-			positive++
-		} else if diff < 0 {
-			negative++
-		}
-		// diff == 0: same port, doesn't count either way
+	mid := len(obs) / 2
+	earlySum, lateSum := 0, 0
+	for i := 0; i < mid; i++ {
+		earlySum += obs[i].observedPort
 	}
-
-	total := positive + negative
-	if total == 0 {
-		// All ports identical — shouldn't reach here (caller checks allSame),
-		// but treat as Cone-like behavior.
-		return NATSymmetricHard
+	for i := mid; i < len(obs); i++ {
+		lateSum += obs[i].observedPort
 	}
+	earlyAvg := float64(earlySum) / float64(mid)
+	lateAvg := float64(lateSum) / float64(len(obs)-mid)
 
-	ratio := float64(positive) / float64(total)
-	if ratio >= 0.75 {
+	if lateAvg > earlyAvg {
 		return NATSymmetricEasyInc
 	}
-	if ratio <= 0.25 { // 75%+ negative
-		return NATSymmetricEasyDec
-	}
-	return NATSymmetricHard
+	return NATSymmetricEasyDec
 }
 
 // latestObservedPort returns the observed port from the most recent observation.
