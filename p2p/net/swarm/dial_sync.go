@@ -49,6 +49,9 @@ func (ad *activeDial) dial(ctx context.Context) (*Conn, error) {
 	if simConnect, isClient, reason := network.GetSimultaneousConnect(ctx); simConnect {
 		dialCtx = network.WithSimultaneousConnect(dialCtx, isClient, reason)
 	}
+	if punchedInfo := network.GetPunchedSocket(ctx); punchedInfo != nil {
+		dialCtx = network.WithPunchedSocket(dialCtx, punchedInfo)
+	}
 
 	resch := make(chan dialResponse, 1)
 	select {
